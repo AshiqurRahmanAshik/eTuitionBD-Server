@@ -52,6 +52,19 @@ async function run() {
     const db = client.db("etuitionDB");
     const tuitionCollection = db.collection("tuitions");
 
+    // save a tuition data in db
+    app.post("/tuitions", async (req, res) => {
+      const tuitionData = req.body;
+      const result = await tuitionCollection.insertOne(tuitionData);
+      res.send(result);
+    });
+
+    // get all tuitions from db
+    app.get("/tuitions", async (req, res) => {
+      const result = tuitionCollection.find().toArray();
+      res.send(result);
+    });
+
     await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
