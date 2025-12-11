@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const admin = require("firebase-admin");
 const port = process.env.PORT || 3000;
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
@@ -47,6 +47,7 @@ const client = new MongoClient(process.env.MONGODB_URI, {
     deprecationErrors: true,
   },
 });
+
 async function run() {
   try {
     const db = client.db("etuitionDB");
@@ -61,8 +62,27 @@ async function run() {
 
     // get all tuitions from db
     app.get("/tuitions", async (req, res) => {
-      const result = tuitionCollection.find().toArray();
-      res.send(result);
+      try {
+        const result = await tuitionCollection.find().toArray(); // await add করা হয়েছে
+        console.log("Tuitions found:", result.length); // debug করার জন্য
+        res.send(result);
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Error fetching tuitions" });
+      }
+    });
+
+    // get single tuition by id
+    app.get("/tuitions/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+        const result = await tuitionCollection.findOne(query);
+        res.send(result);
+      } catch (error) {
+        console.log(error);
+        res.status(500).send({ message: "Error fetching tuition" });
+      }
     });
 
     await client.db("admin").command({ ping: 1 });
