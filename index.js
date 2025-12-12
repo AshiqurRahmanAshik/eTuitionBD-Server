@@ -173,7 +173,7 @@ async function run() {
             schedule: tuition.schedule,
             phone: tuition.phone,
             price: session.amount_total / 100,
-            seller: tuition.postedBy || {}, 
+            seller: tuition.postedBy || {},
             createdAt: new Date(),
           };
 
@@ -235,6 +235,43 @@ async function run() {
         console.error("Error fetching tutor tuitions:", error);
         res.status(500).send({ error: "Failed to fetch tutor tuitions" });
       }
+    });
+
+    const usersCollection = db.collection("users");
+    // save or update a user in db
+    app.post("/user", async (req, res) => {
+      const userData = req.body;
+
+      // If role is provided, use it; otherwise default to 'student'
+      userData.role = userData.role || "student";
+      userData.created_at = new Date().toISOString();
+      userData.last_loggedIn = new Date().toISOString();
+
+      const query = { email: userData.email };
+
+      const alreadyExists = await usersCollection.findOne(query);
+      console.log("User Already Exists---> ", !!alreadyExists);
+
+      if (alreadyExists) {
+        console.log("Updating user info......");
+        const result = await usersCollection.updateOne(query, {
+          $set: {
+            last_loggedIn: new Date().toISOString(),
+            role: userData.role, // update role if provided
+          },
+        });
+        return res.send(result);
+      }
+
+      console.log("Saving new user info......");
+      const result = await usersCollection.insertOne(userData);
+      res.send(result);
+    });
+
+    // get a user's role
+    app.get("/user/role", verifyJWT, async (req, res) => {
+      const result = await usersCollection.findOne({ email: req.tokenEmail });
+      res.send({ role: result?.role || "student" });
     });
 
     // test mongo connection
