@@ -24,10 +24,9 @@ app.use(
   cors({
     origin: [process.env.CLIENT_DOMAIN],
     credentials: true,
-    optionsSuccessStatus: 200, // FIXED
+    optionsSuccessStatus: 200,
   })
 );
-
 app.use(express.json());
 
 // JWT middleware
@@ -57,13 +56,15 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 
 async function run() {
   try {
-    // REQUIRED: connect to DB
     await client.connect();
 
     const db = client.db("etuitionDB");
     const tuitionCollection = db.collection("tuitions");
+    const ordersCollection = db.collection("orders");
+    const usersCollection = db.collection("users");
 
-    // save a tuition data in db
+    /*** Tuitions Routes ***/
+    // Save a tuition
     app.post("/tuitions", async (req, res) => {
       try {
         const tuitionData = req.body;
@@ -74,7 +75,7 @@ async function run() {
       }
     });
 
-    // get all tuitions from db
+    // Get all tuitions
     app.get("/tuitions", async (req, res) => {
       try {
         const result = await tuitionCollection.find().toArray();
@@ -84,7 +85,7 @@ async function run() {
       }
     });
 
-    // get a single tuition by id
+    // Get a single tuition by id
     app.get("/tuitions/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -96,7 +97,7 @@ async function run() {
       }
     });
 
-    // Payment checkouts
+    /*** Stripe Payment Routes ***/
     app.post("/create-checkout-session", async (req, res) => {
       try {
         const paymentInfo = req.body;
@@ -106,12 +107,12 @@ async function run() {
           line_items: [
             {
               price_data: {
-                currency: "bdt", // BDT currency
+                currency: "bdt",
                 product_data: {
                   name: paymentInfo?.name,
                   description: paymentInfo?.description,
                 },
-                unit_amount: paymentInfo?.price * 100, // 1 BDT = 100 poisha
+                unit_amount: paymentInfo?.price * 100,
               },
               quantity: paymentInfo?.quantity || 1,
             },
@@ -132,8 +133,6 @@ async function run() {
         res.status(500).send({ error: "Payment session creation failed" });
       }
     });
-    // Add this inside your run() function, after other routes
-    const ordersCollection = db.collection("orders");
 
     app.post("/payment-success", async (req, res) => {
       try {
@@ -149,18 +148,15 @@ async function run() {
           return res.status(404).send({ message: "Session not found" });
         }
 
-        // Check if tuition exists
         const tuition = await tuitionCollection.findOne({
           _id: new ObjectId(session.metadata.tuitionId),
         });
 
-        // Check if order already exists
         const existingOrder = await ordersCollection.findOne({
           transactionId: session.payment_intent,
         });
 
         if (session.payment_status === "paid" && tuition && !existingOrder) {
-          // Save order data
           const orderInfo = {
             tuitionId: session.metadata.tuitionId,
             transactionId: session.payment_intent,
@@ -185,7 +181,6 @@ async function run() {
           });
         }
 
-        // If order already exists
         return res.send({
           transactionId: session.payment_intent,
           orderId: existingOrder?._id || null,
@@ -195,7 +190,8 @@ async function run() {
         res.status(500).send({ error: "Payment processing failed" });
       }
     });
-    // Get all orders for a customer by email
+
+    /*** Orders Routes ***/
     app.get("/my-orders/:email", async (req, res) => {
       try {
         const email = req.params.email;
@@ -209,7 +205,6 @@ async function run() {
       }
     });
 
-    // Get all orders for a seller (tutor) by email
     app.get("/manage-orders/:email", async (req, res) => {
       try {
         const email = req.params.email;
@@ -223,7 +218,7 @@ async function run() {
       }
     });
 
-    // Get all tuitions posted by a tutor by email
+    /*** Tutor Tuitions ***/
     app.get("/my-tuitions/:email", async (req, res) => {
       try {
         const email = req.params.email;
@@ -237,44 +232,61 @@ async function run() {
       }
     });
 
-    const usersCollection = db.collection("users");
-    // save or update a user in db
+    /*** Users Routes ***/
+    // Save or update a user
     app.post("/user", async (req, res) => {
-      const userData = req.body;
+      try {
+        const userData = req.body;
 
-      // If role is provided, use it; otherwise default to 'student'
-      userData.role = userData.role || "student";
-      userData.created_at = new Date().toISOString();
-      userData.last_loggedIn = new Date().toISOString();
+        userData.role = userData.role || "Student";
+        userData.created_at = new Date().toISOString();
+        userData.last_loggedIn = new Date().toISOString();
 
-      const query = { email: userData.email };
+        const query = { email: userData.email };
+        const alreadyExists = await usersCollection.findOne(query);
 
-      const alreadyExists = await usersCollection.findOne(query);
-      console.log("User Already Exists---> ", !!alreadyExists);
+        if (alreadyExists) {
+          const result = await usersCollection.updateOne(query, {
+            $set: {
+              last_loggedIn: new Date().toISOString(),
+              role: userData.role,
+            },
+          });
+          return res.send(result);
+        }
 
-      if (alreadyExists) {
-        console.log("Updating user info......");
-        const result = await usersCollection.updateOne(query, {
-          $set: {
-            last_loggedIn: new Date().toISOString(),
-            role: userData.role, // update role if provided
-          },
-        });
-        return res.send(result);
+        const result = await usersCollection.insertOne(userData);
+        res.send(result);
+      } catch (error) {
+        console.error("Error saving/updating user:", error);
+        res.status(500).send({ error: "Failed to save or update user" });
       }
-
-      console.log("Saving new user info......");
-      const result = await usersCollection.insertOne(userData);
-      res.send(result);
     });
 
-    // get a user's role
+    // Get a user's role by email
+    app.get("/user/role/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const user = await usersCollection.findOne({ email });
+        res.send({ role: user?.role || "Student" });
+      } catch (error) {
+        console.error("Error fetching user role:", error);
+        res.status(500).send({ error: "Failed to fetch user role" });
+      }
+    });
+
+    // Get logged-in user's role (JWT required)
     app.get("/user/role", verifyJWT, async (req, res) => {
-      const result = await usersCollection.findOne({ email: req.tokenEmail });
-      res.send({ role: result?.role || "student" });
+      try {
+        const result = await usersCollection.findOne({ email: req.tokenEmail });
+        res.send({ role: result?.role || "Student" });
+      } catch (error) {
+        console.error("Error fetching user role:", error);
+        res.status(500).send({ error: "Failed to fetch user role" });
+      }
     });
 
-    // test mongo connection
+    // Test MongoDB connection
     await client.db("admin").command({ ping: 1 });
     console.log("Connected to MongoDB successfully.");
   } catch (err) {
@@ -284,12 +296,12 @@ async function run() {
 
 run().catch(console.dir);
 
-// default route
+// Default route
 app.get("/", (req, res) => {
   res.send("Hello from Server..");
 });
 
-// start server
+// Start server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
