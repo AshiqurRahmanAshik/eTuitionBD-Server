@@ -3,43 +3,50 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const admin = require("firebase-admin");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
 const port = process.env.PORT || 3000;
+
+// Decode Firebase admin key
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
   "utf-8"
 );
 const serviceAccount = JSON.parse(decoded);
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
 const app = express();
+
 // middleware
 app.use(
   cors({
-    origin: ["http://localhost:5173", "http://localhost:5174"],
+    origin: [process.env.CLIENT_DOMAIN],
     credentials: true,
-    optionSuccessStatus: 200,
+    optionsSuccessStatus: 200, // FIXED
   })
 );
+
 app.use(express.json());
 
-// jwt middlewares
+// JWT middleware
 const verifyJWT = async (req, res, next) => {
-  const token = req?.headers?.authorization?.split(" ")[1];
-  console.log(token);
-  if (!token) return res.status(401).send({ message: "Unauthorized Access!" });
+  const authHeader = req.headers.authorization;
+  if (!authHeader)
+    return res.status(401).send({ message: "Unauthorized Access!" });
+
+  const token = authHeader.split(" ")[1];
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.tokenEmail = decoded.email;
-    console.log(decoded);
     next();
   } catch (err) {
-    console.log(err);
     return res.status(401).send({ message: "Unauthorized Access!", err });
   }
 };
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
+// MongoDB client
 const client = new MongoClient(process.env.MONGODB_URI, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -50,29 +57,34 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 
 async function run() {
   try {
+    // REQUIRED: connect to DB
+    await client.connect();
+
     const db = client.db("etuitionDB");
     const tuitionCollection = db.collection("tuitions");
 
     // save a tuition data in db
     app.post("/tuitions", async (req, res) => {
-      const tuitionData = req.body;
-      const result = await tuitionCollection.insertOne(tuitionData);
-      res.send(result);
+      try {
+        const tuitionData = req.body;
+        const result = await tuitionCollection.insertOne(tuitionData);
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Error saving tuition", error });
+      }
     });
 
     // get all tuitions from db
     app.get("/tuitions", async (req, res) => {
       try {
-        const result = await tuitionCollection.find().toArray(); // await add করা হয়েছে
-        console.log("Tuitions found:", result.length); // debug করার জন্য
+        const result = await tuitionCollection.find().toArray();
         res.send(result);
       } catch (error) {
-        console.log(error);
-        res.status(500).send({ message: "Error fetching tuitions" });
+        res.status(500).send({ message: "Error fetching tuitions", error });
       }
     });
 
-    // get single tuition by id
+    // get a single tuition by id
     app.get("/tuitions/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -80,25 +92,167 @@ async function run() {
         const result = await tuitionCollection.findOne(query);
         res.send(result);
       } catch (error) {
-        console.log(error);
-        res.status(500).send({ message: "Error fetching tuition" });
+        res.status(500).send({ message: "Error fetching tuition", error });
       }
     });
 
+    // Payment checkouts
+    app.post("/create-checkout-session", async (req, res) => {
+      try {
+        const paymentInfo = req.body;
+        console.log(paymentInfo);
+
+        const session = await stripe.checkout.sessions.create({
+          line_items: [
+            {
+              price_data: {
+                currency: "bdt", // BDT currency
+                product_data: {
+                  name: paymentInfo?.name,
+                  description: paymentInfo?.description,
+                },
+                unit_amount: paymentInfo?.price * 100, // 1 BDT = 100 poisha
+              },
+              quantity: paymentInfo?.quantity || 1,
+            },
+          ],
+          customer_email: paymentInfo?.customer?.email,
+          mode: "payment",
+          metadata: {
+            tuitionId: paymentInfo?.tuitionId,
+            customer: paymentInfo?.customer?.email,
+          },
+          success_url: `${process.env.CLIENT_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.CLIENT_DOMAIN}/tuition/${paymentInfo?.tuitionId}`,
+        });
+
+        res.send({ url: session.url });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ error: "Payment session creation failed" });
+      }
+    });
+    // Add this inside your run() function, after other routes
+    const ordersCollection = db.collection("orders");
+
+    app.post("/payment-success", async (req, res) => {
+      try {
+        const { sessionId } = req.body;
+
+        if (!sessionId) {
+          return res.status(400).send({ message: "Session ID is required" });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (!session) {
+          return res.status(404).send({ message: "Session not found" });
+        }
+
+        // Check if tuition exists
+        const tuition = await tuitionCollection.findOne({
+          _id: new ObjectId(session.metadata.tuitionId),
+        });
+
+        // Check if order already exists
+        const existingOrder = await ordersCollection.findOne({
+          transactionId: session.payment_intent,
+        });
+
+        if (session.payment_status === "paid" && tuition && !existingOrder) {
+          // Save order data
+          const orderInfo = {
+            tuitionId: session.metadata.tuitionId,
+            transactionId: session.payment_intent,
+            customer: session.metadata.customer,
+            status: "pending",
+            subject: tuition.subject,
+            className: tuition.className,
+            medium: tuition.medium,
+            location: tuition.location,
+            schedule: tuition.schedule,
+            phone: tuition.phone,
+            price: session.amount_total / 100,
+            seller: tuition.postedBy || {}, 
+            createdAt: new Date(),
+          };
+
+          const result = await ordersCollection.insertOne(orderInfo);
+
+          return res.send({
+            transactionId: session.payment_intent,
+            orderId: result.insertedId,
+          });
+        }
+
+        // If order already exists
+        return res.send({
+          transactionId: session.payment_intent,
+          orderId: existingOrder?._id || null,
+        });
+      } catch (error) {
+        console.error("Payment success error:", error);
+        res.status(500).send({ error: "Payment processing failed" });
+      }
+    });
+    // Get all orders for a customer by email
+    app.get("/my-orders/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const result = await ordersCollection
+          .find({ customer: email })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching customer orders:", error);
+        res.status(500).send({ error: "Failed to fetch customer orders" });
+      }
+    });
+
+    // Get all orders for a seller (tutor) by email
+    app.get("/manage-orders/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const result = await ordersCollection
+          .find({ "seller.email": email })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching tutor orders:", error);
+        res.status(500).send({ error: "Failed to fetch tutor orders" });
+      }
+    });
+
+    // Get all tuitions posted by a tutor by email
+    app.get("/my-tuitions/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+        const result = await tuitionCollection
+          .find({ "postedBy.email": email })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching tutor tuitions:", error);
+        res.status(500).send({ error: "Failed to fetch tutor tuitions" });
+      }
+    });
+
+    // test mongo connection
     await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
-  } finally {
-    // Ensures that the client will close when you finish/error
+    console.log("Connected to MongoDB successfully.");
+  } catch (err) {
+    console.error("MongoDB Connection Error:", err);
   }
 }
+
 run().catch(console.dir);
 
+// default route
 app.get("/", (req, res) => {
   res.send("Hello from Server..");
 });
 
+// start server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
