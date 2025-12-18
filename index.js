@@ -650,13 +650,25 @@ async function run() {
         console.log("💰 Stripe session amount_total:", session.amount_total);
         console.log("💵 Calculated amount:", session.amount_total / 100);
 
+        // Calculate platform commission (10%)
+        const totalAmount = Number(session.amount_total / 100) || 0;
+        const platformCommission = totalAmount * 0.1; // 10% commission
+        const tutorAmount = totalAmount - platformCommission;
+
+        console.log("💵 Total Amount:", totalAmount);
+        console.log("💰 Platform Commission (10%):", platformCommission);
+        console.log("👨‍🏫 Tutor Amount:", tutorAmount);
+
         const paymentRecord = {
           applicationId,
           tuitionId,
           transactionId: session.payment_intent,
           studentEmail,
           tutorEmail,
-          amount: Number(session.amount_total / 100) || 0,
+          totalAmount: totalAmount,
+          platformCommission: platformCommission,
+          tutorAmount: tutorAmount,
+          amount: totalAmount, // Keep for backward compatibility
           status: "completed",
           paidAt: new Date(),
         };
@@ -746,7 +758,7 @@ async function run() {
       }
     });
 
-    // ✅ Get tutor's revenue history (FIXED - with tuition details)
+    // ✅ Get tutor's revenue history (FIXED - with tuition details and commission)
     app.get("/tutor-revenue", verifyJWT, verifyTUTOR, async (req, res) => {
       try {
         const revenue = await ordersCollection
@@ -764,8 +776,9 @@ async function run() {
           })
         );
 
+        // Calculate total revenue (tutor's portion only, after platform commission)
         const totalRevenue = revenue.reduce(
-          (sum, payment) => sum + payment.amount,
+          (sum, payment) => sum + (payment.tutorAmount || payment.amount || 0),
           0
         );
 
@@ -1053,14 +1066,25 @@ async function run() {
       }
     );
 
-    // ✅ Get platform statistics (admin)
+    // ✅ Get platform statistics (admin) - WITH COMMISSION
     app.get("/admin/statistics", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const totalUsers = await usersCollection.countDocuments();
         const totalTuitions = await tuitionsCollection.countDocuments();
         const totalApplications = await applicationsCollection.countDocuments();
-        const totalRevenue = await ordersCollection
-          .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+
+        // Calculate total revenue and platform commission
+        const revenueData = await ordersCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                totalRevenue: { $sum: "$totalAmount" },
+                platformRevenue: { $sum: "$platformCommission" },
+                tutorRevenue: { $sum: "$tutorAmount" },
+              },
+            },
+          ])
           .toArray();
 
         const students = await usersCollection.countDocuments({
@@ -1087,7 +1111,9 @@ async function run() {
           totalUsers,
           totalTuitions,
           totalApplications,
-          totalRevenue: totalRevenue[0]?.total || 0,
+          totalRevenue: revenueData[0]?.totalRevenue || 0,
+          platformRevenue: revenueData[0]?.platformRevenue || 0,
+          tutorRevenue: revenueData[0]?.tutorRevenue || 0,
           usersByRole: { students, tutors, admins },
           tuitionsByStatus: {
             pendingTuitions,
@@ -1101,30 +1127,71 @@ async function run() {
       }
     });
 
-    // ✅ Get all transactions (admin)
+    // ✅ Get all transactions (admin) - UPDATED to handle old structure
     app.get("/admin/transactions", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const transactions = await ordersCollection
           .find()
-          .sort({ paidAt: -1 })
+          .sort({ paidAt: -1, createdAt: -1 })
           .toArray();
 
         const populatedTransactions = await Promise.all(
           transactions.map(async (transaction) => {
-            const tuition = await tuitionsCollection.findOne({
-              _id: new ObjectId(transaction.tuitionId),
-            });
-            const student = await usersCollection.findOne({
-              email: transaction.studentEmail,
-            });
-            const tutor = await usersCollection.findOne({
-              email: transaction.tutorEmail,
-            });
-            return { ...transaction, tuition, student, tutor };
+            // Check if this is new structure (has applicationId)
+            if (transaction.applicationId) {
+              const tuition = await tuitionsCollection.findOne({
+                _id: new ObjectId(transaction.tuitionId),
+              });
+              const student = await usersCollection.findOne({
+                email: transaction.studentEmail,
+              });
+              const tutor = await usersCollection.findOne({
+                email: transaction.tutorEmail,
+              });
+              return {
+                ...transaction,
+                tuition,
+                student,
+                tutor,
+                // Normalize the amount field
+                amount: transaction.amount || 0,
+              };
+            }
+            // Old structure - convert to new format
+            else {
+              const tuition = await tuitionsCollection.findOne({
+                _id: new ObjectId(transaction.tuitionId),
+              });
+              const student = await usersCollection.findOne({
+                email: transaction.customer,
+              });
+
+              return {
+                ...transaction,
+                // Map old fields to new fields
+                studentEmail: transaction.customer,
+                tutorEmail: null,
+                amount: transaction.price || 0,
+                status:
+                  transaction.status === "pending" ? "pending" : "completed",
+                paidAt: transaction.createdAt,
+                tuition: tuition || {
+                  subject: transaction.subject,
+                  class: transaction.className,
+                },
+                student,
+                tutor: null,
+              };
+            }
           })
         );
 
-        res.send(populatedTransactions);
+        // Filter out old pending transactions or include based on your need
+        const validTransactions = populatedTransactions.filter(
+          (t) => t.status === "completed" || t.amount > 0
+        );
+
+        res.send(validTransactions);
       } catch (error) {
         console.error("Error fetching transactions:", error);
         res.status(500).send({ message: "Failed to fetch transactions" });
@@ -1146,6 +1213,159 @@ async function run() {
         res.status(500).send({ message: "Failed to save contact" });
       }
     });
+
+    /* ================= DATABASE FIX ENDPOINTS (ADMIN ONLY) ================= */
+
+    // ✅ Clean up old transaction structure (ADMIN ONLY)
+    app.post(
+      "/admin/cleanup-old-transactions",
+      verifyJWT,
+      verifyADMIN,
+      async (req, res) => {
+        try {
+          console.log("🧹 Starting cleanup of old transaction structure...");
+
+          // Find old structure transactions (those without applicationId)
+          const oldTransactions = await ordersCollection
+            .find({
+              applicationId: { $exists: false },
+              status: "pending", // Only delete pending old ones
+            })
+            .toArray();
+
+          console.log(
+            `Found ${oldTransactions.length} old pending transactions`
+          );
+
+          if (oldTransactions.length === 0) {
+            return res.send({
+              message: "No old pending transactions found",
+              deleted: 0,
+            });
+          }
+
+          // Delete old pending transactions
+          const result = await ordersCollection.deleteMany({
+            applicationId: { $exists: false },
+            status: "pending",
+          });
+
+          console.log(`🗑️ Deleted ${result.deletedCount} old transactions`);
+
+          res.send({
+            message: `Cleaned up ${result.deletedCount} old pending transactions`,
+            deleted: result.deletedCount,
+          });
+        } catch (error) {
+          console.error("Error cleaning up transactions:", error);
+          res.status(500).send({ message: "Failed to cleanup transactions" });
+        }
+      }
+    );
+
+    // ✅ Fix old transactions with missing/invalid amounts (ADMIN ONLY)
+    app.post(
+      "/admin/fix-transactions",
+      verifyJWT,
+      verifyADMIN,
+      async (req, res) => {
+        try {
+          console.log("🔧 Starting transaction fix...");
+
+          // Find all transactions with invalid amounts in NEW structure
+          const invalidTransactions = await ordersCollection
+            .find({
+              applicationId: { $exists: true }, // Only new structure
+              $or: [
+                { amount: { $exists: false } },
+                { amount: null },
+                { amount: 0 },
+              ],
+            })
+            .toArray();
+
+          console.log(
+            `Found ${invalidTransactions.length} invalid transactions`
+          );
+
+          if (invalidTransactions.length === 0) {
+            return res.send({
+              message: "No invalid transactions found",
+              fixed: 0,
+            });
+          }
+
+          let fixedCount = 0;
+
+          // For each invalid transaction, try to get amount from application
+          for (const transaction of invalidTransactions) {
+            try {
+              const application = await applicationsCollection.findOne({
+                _id: new ObjectId(transaction.applicationId),
+              });
+
+              if (application && application.expectedSalary) {
+                await ordersCollection.updateOne(
+                  { _id: transaction._id },
+                  { $set: { amount: parseFloat(application.expectedSalary) } }
+                );
+                fixedCount++;
+                console.log(
+                  `✅ Fixed transaction ${transaction._id} with amount ${application.expectedSalary}`
+                );
+              } else {
+                console.log(
+                  `⚠️ Could not find amount for transaction ${transaction._id}`
+                );
+              }
+            } catch (err) {
+              console.error(
+                `Error fixing transaction ${transaction._id}:`,
+                err
+              );
+            }
+          }
+
+          res.send({
+            message: `Fixed ${fixedCount} out of ${invalidTransactions.length} transactions`,
+            fixed: fixedCount,
+            total: invalidTransactions.length,
+          });
+        } catch (error) {
+          console.error("Error fixing transactions:", error);
+          res.status(500).send({ message: "Failed to fix transactions" });
+        }
+      }
+    );
+
+    // ✅ Delete invalid transactions (ADMIN ONLY - use with caution)
+    app.delete(
+      "/admin/delete-invalid-transactions",
+      verifyJWT,
+      verifyADMIN,
+      async (req, res) => {
+        try {
+          const result = await ordersCollection.deleteMany({
+            applicationId: { $exists: true }, // Only new structure
+            $or: [
+              { amount: { $exists: false } },
+              { amount: null },
+              { amount: 0 },
+            ],
+          });
+
+          console.log(`🗑️ Deleted ${result.deletedCount} invalid transactions`);
+
+          res.send({
+            message: `Deleted ${result.deletedCount} invalid transactions`,
+            deletedCount: result.deletedCount,
+          });
+        } catch (error) {
+          console.error("Error deleting transactions:", error);
+          res.status(500).send({ message: "Failed to delete transactions" });
+        }
+      }
+    );
 
     await client.db("admin").command({ ping: 1 });
     console.log("✅ MongoDB connected successfully");
