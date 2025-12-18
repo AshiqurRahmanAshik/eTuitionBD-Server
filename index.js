@@ -59,7 +59,7 @@ async function run() {
     const ordersCollection = db.collection("orders");
     const usersCollection = db.collection("users");
     const tutorRequestsCollection = db.collection("tutorRequests");
-    const tutorsCollection = db.collection("tutors"); // ✅ Added tutors collection
+    const tutorsCollection = db.collection("tutors");
 
     /* ================= ROLE MIDDLEWARE ================= */
     const verifyADMIN = async (req, res, next) => {
@@ -129,7 +129,32 @@ async function run() {
       }
     });
 
-    // ✅ Get single tutor profile
+    // ✅ Get tutor profile by ID (secure - doesn't expose email in URL)
+    app.get("/tutors/profile/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        // Validate ObjectId
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid tutor ID" });
+        }
+
+        const tutor = await tutorsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!tutor) {
+          return res.status(404).send({ message: "Tutor not found" });
+        }
+
+        res.send(tutor);
+      } catch (error) {
+        console.error("Error fetching tutor profile:", error);
+        res.status(500).send({ message: "Failed to fetch tutor profile" });
+      }
+    });
+
+    // ✅ Get single tutor profile by email (legacy - kept for backward compatibility)
     app.get("/tutors/:email", async (req, res) => {
       try {
         const tutor = await tutorsCollection.findOne({
@@ -156,7 +181,7 @@ async function run() {
             email: req.tokenEmail,
             name: req.body.studentName,
           },
-          status: "pending", // Admin will approve
+          status: "pending",
           createdAt: new Date(),
         };
         const result = await tuitionsCollection.insertOne(tuitionData);
@@ -181,14 +206,13 @@ async function run() {
       }
     });
 
-    // ✅ Search, Filter & Sort tuitions (Challenge Requirement)
+    // ✅ Search, Filter & Sort tuitions
     app.get("/tuitions/search", async (req, res) => {
       try {
         const { search, subject, class: className, location, sort } = req.query;
 
         let query = { status: "approved" };
 
-        // Search by subject or location
         if (search) {
           query.$or = [
             { subject: { $regex: search, $options: "i" } },
@@ -196,23 +220,11 @@ async function run() {
           ];
         }
 
-        // Filter by subject
-        if (subject) {
-          query.subject = subject;
-        }
+        if (subject) query.subject = subject;
+        if (className) query.class = className;
+        if (location) query.location = { $regex: location, $options: "i" };
 
-        // Filter by class
-        if (className) {
-          query.class = className;
-        }
-
-        // Filter by location
-        if (location) {
-          query.location = { $regex: location, $options: "i" };
-        }
-
-        // Sort options
-        let sortOption = { createdAt: -1 }; // Default: newest first
+        let sortOption = { createdAt: -1 };
         if (sort === "budget-asc") sortOption = { budget: 1 };
         if (sort === "budget-desc") sortOption = { budget: -1 };
         if (sort === "date-asc") sortOption = { createdAt: 1 };
@@ -230,7 +242,7 @@ async function run() {
       }
     });
 
-    // ✅ Pagination for tuitions (Challenge Requirement)
+    // ✅ Pagination for tuitions
     app.get("/tuitions/paginated", async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
@@ -241,7 +253,6 @@ async function run() {
 
         let query = { status: "approved" };
 
-        // Apply filters
         if (search) {
           query.$or = [
             { subject: { $regex: search, $options: "i" } },
@@ -252,7 +263,6 @@ async function run() {
         if (className) query.class = className;
         if (location) query.location = { $regex: location, $options: "i" };
 
-        // Sort options
         let sortOption = { createdAt: -1 };
         if (sort === "budget-asc") sortOption = { budget: 1 };
         if (sort === "budget-desc") sortOption = { budget: -1 };
@@ -292,7 +302,7 @@ async function run() {
       }
     });
 
-    // ✅ Get student's own tuitions (all statuses)
+    // ✅ Get student's own tuitions
     app.get("/my-tuitions", verifyJWT, async (req, res) => {
       try {
         const result = await tuitionsCollection
@@ -306,7 +316,7 @@ async function run() {
       }
     });
 
-    // ✅ Update tuition (student only, before approval)
+    // ✅ Update tuition
     app.patch("/tuitions/:id", verifyJWT, async (req, res) => {
       try {
         const tuitionId = req.params.id;
@@ -314,12 +324,10 @@ async function run() {
           _id: new ObjectId(tuitionId),
         });
 
-        // Check ownership
         if (tuition.postedBy.email !== req.tokenEmail) {
           return res.status(403).send({ message: "Forbidden" });
         }
 
-        // Can't update if already approved
         if (tuition.status === "approved") {
           return res
             .status(400)
@@ -341,7 +349,7 @@ async function run() {
       }
     });
 
-    // ✅ Delete tuition (student only)
+    // ✅ Delete tuition
     app.delete("/tuitions/:id", verifyJWT, async (req, res) => {
       try {
         const tuitionId = req.params.id;
@@ -349,7 +357,6 @@ async function run() {
           _id: new ObjectId(tuitionId),
         });
 
-        // Check ownership
         if (tuition.postedBy.email !== req.tokenEmail) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -358,7 +365,6 @@ async function run() {
           _id: new ObjectId(tuitionId),
         });
 
-        // Also delete related applications
         await applicationsCollection.deleteMany({ tuitionId });
 
         res.send(result);
@@ -376,7 +382,6 @@ async function run() {
         const { tuitionId, qualifications, experience, expectedSalary } =
           req.body;
 
-        // Check if already applied
         const existingApp = await applicationsCollection.findOne({
           tuitionId,
           tutorEmail: req.tokenEmail,
@@ -410,7 +415,7 @@ async function run() {
       }
     });
 
-    // ✅ Get applications for a specific tuition (student view)
+    // ✅ Get applications for a specific tuition
     app.get("/tuitions/:id/applications", verifyJWT, async (req, res) => {
       try {
         const tuitionId = req.params.id;
@@ -418,7 +423,6 @@ async function run() {
           _id: new ObjectId(tuitionId),
         });
 
-        // Check ownership
         if (tuition.postedBy.email !== req.tokenEmail) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -435,15 +439,23 @@ async function run() {
       }
     });
 
-    // ✅ Get tutor's own applications
+    // ✅ Get tutor's own applications (FIXED)
     app.get("/my-applications", verifyJWT, verifyTUTOR, async (req, res) => {
       try {
+        const { status } = req.query; // Add query parameter for filtering
+
+        let query = { tutorEmail: req.tokenEmail };
+
+        // Add status filter if provided
+        if (status) {
+          query.status = status;
+        }
+
         const applications = await applicationsCollection
-          .find({ tutorEmail: req.tokenEmail })
+          .find(query)
           .sort({ appliedAt: -1 })
           .toArray();
 
-        // Populate tuition details
         const populatedApps = await Promise.all(
           applications.map(async (app) => {
             const tuition = await tuitionsCollection.findOne({
@@ -456,11 +468,11 @@ async function run() {
         res.send(populatedApps);
       } catch (error) {
         console.error("Error fetching applications:", error);
-        res.status(500).send({ message: "Failed to fetch applications" });
+        res.status(500).send({ message: "Failed to fetch applications" }); // FIXED: was res.send
       }
     });
 
-    // ✅ Update application (tutor can edit pending applications)
+    // ✅ Update application
     app.patch("/applications/:id", verifyJWT, verifyTUTOR, async (req, res) => {
       try {
         const appId = req.params.id;
@@ -498,7 +510,7 @@ async function run() {
       }
     });
 
-    // ✅ Delete application (tutor can delete pending applications)
+    // ✅ Delete application
     app.delete(
       "/applications/:id",
       verifyJWT,
@@ -562,7 +574,7 @@ async function run() {
 
     /* ================= PAYMENTS ================= */
 
-    // ✅ Create checkout session for tutor payment
+    // ✅ Create checkout session
     app.post("/create-checkout-session", verifyJWT, async (req, res) => {
       try {
         const { applicationId, tuitionId, expectedSalary } = req.body;
@@ -608,46 +620,71 @@ async function run() {
       }
     });
 
-    // ✅ Handle successful payment
+    // ✅ Handle successful payment (FIXED WITH DETAILED LOGGING)
     app.post("/payment-success", verifyJWT, async (req, res) => {
       try {
         const { sessionId } = req.body;
+        console.log("📝 Processing payment for session:", sessionId);
+
         const session = await stripe.checkout.sessions.retrieve(sessionId);
 
         const { applicationId, tuitionId, studentEmail, tutorEmail } =
           session.metadata;
 
-        // Check if already processed
+        console.log("📝 Payment metadata:", {
+          applicationId,
+          tuitionId,
+          studentEmail,
+          tutorEmail,
+        });
+
         const exists = await ordersCollection.findOne({
           transactionId: session.payment_intent,
         });
 
         if (exists) {
+          console.log("⚠️ Payment already processed");
           return res.send(exists);
         }
 
-        // Create payment record
+        console.log("💰 Stripe session amount_total:", session.amount_total);
+        console.log("💵 Calculated amount:", session.amount_total / 100);
+
         const paymentRecord = {
           applicationId,
           tuitionId,
           transactionId: session.payment_intent,
           studentEmail,
           tutorEmail,
-          amount: session.amount_total / 100,
+          amount: Number(session.amount_total / 100) || 0,
           status: "completed",
           paidAt: new Date(),
         };
 
-        await ordersCollection.insertOne(paymentRecord);
+        console.log("📝 Payment record to be saved:", paymentRecord);
 
-        // Update application status to approved
-        await applicationsCollection.updateOne(
+        await ordersCollection.insertOne(paymentRecord);
+        console.log("✅ Payment record created successfully");
+
+        // Update the application status to approved
+        const updateResult = await applicationsCollection.updateOne(
           { _id: new ObjectId(applicationId) },
           { $set: { status: "approved", approvedAt: new Date() } }
         );
+        console.log(
+          "✅ Application approved:",
+          updateResult.modifiedCount,
+          "documents updated"
+        );
 
-        // Reject other pending applications for this tuition
-        await applicationsCollection.updateMany(
+        // Verify the update
+        const updatedApp = await applicationsCollection.findOne({
+          _id: new ObjectId(applicationId),
+        });
+        console.log("✅ Verified application status:", updatedApp?.status);
+
+        // Reject all other pending applications for this tuition
+        const rejectResult = await applicationsCollection.updateMany(
           {
             tuitionId,
             _id: { $ne: new ObjectId(applicationId) },
@@ -655,9 +692,14 @@ async function run() {
           },
           { $set: { status: "rejected", rejectedAt: new Date() } }
         );
+        console.log(
+          "✅ Other applications rejected:",
+          rejectResult.modifiedCount,
+          "documents updated"
+        );
 
         // Update tuition status to hired
-        await tuitionsCollection.updateOne(
+        const tuitionUpdateResult = await tuitionsCollection.updateOne(
           { _id: new ObjectId(tuitionId) },
           {
             $set: {
@@ -667,10 +709,15 @@ async function run() {
             },
           }
         );
+        console.log(
+          "✅ Tuition marked as hired:",
+          tuitionUpdateResult.modifiedCount,
+          "documents updated"
+        );
 
         res.send({ message: "Payment successful", paymentRecord });
       } catch (error) {
-        console.error("Error processing payment:", error);
+        console.error("❌ Error processing payment:", error);
         res.status(500).send({ message: "Failed to process payment" });
       }
     });
@@ -683,7 +730,6 @@ async function run() {
           .sort({ paidAt: -1 })
           .toArray();
 
-        // Populate with tuition details
         const populatedPayments = await Promise.all(
           payments.map(async (payment) => {
             const tuition = await tuitionsCollection.findOne({
@@ -700,7 +746,7 @@ async function run() {
       }
     });
 
-    // ✅ Get tutor's revenue history
+    // ✅ Get tutor's revenue history (FIXED - with tuition details)
     app.get("/tutor-revenue", verifyJWT, verifyTUTOR, async (req, res) => {
       try {
         const revenue = await ordersCollection
@@ -708,13 +754,22 @@ async function run() {
           .sort({ paidAt: -1 })
           .toArray();
 
-        // Calculate total revenue
+        // Populate tuition details for each payment
+        const populatedRevenue = await Promise.all(
+          revenue.map(async (payment) => {
+            const tuition = await tuitionsCollection.findOne({
+              _id: new ObjectId(payment.tuitionId),
+            });
+            return { ...payment, tuition };
+          })
+        );
+
         const totalRevenue = revenue.reduce(
           (sum, payment) => sum + payment.amount,
           0
         );
 
-        res.send({ revenue, totalRevenue });
+        res.send({ revenue: populatedRevenue, totalRevenue });
       } catch (error) {
         console.error("Error fetching revenue:", error);
         res.status(500).send({ message: "Failed to fetch revenue" });
@@ -822,7 +877,7 @@ async function run() {
       }
     });
 
-    // ✅ Get all users (admin only)
+    // ✅ Get all users (admin)
     app.get("/users", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const users = await usersCollection.find().toArray();
@@ -833,7 +888,7 @@ async function run() {
       }
     });
 
-    // ✅ Update user (admin only)
+    // ✅ Update user (admin)
     app.patch("/users/:email", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const email = req.params.email;
@@ -856,12 +911,11 @@ async function run() {
       }
     });
 
-    // ✅ Delete user (admin only)
+    // ✅ Delete user (admin)
     app.delete("/users/:email", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const email = req.params.email;
 
-        // Don't allow deleting yourself
         if (email === req.tokenEmail) {
           return res
             .status(400)
@@ -947,7 +1001,7 @@ async function run() {
       }
     });
 
-    // ✅ Get all pending tuitions (admin)
+    // ✅ Get all tuitions (admin)
     app.get("/admin/tuitions", verifyJWT, verifyADMIN, async (req, res) => {
       try {
         const tuitions = await tuitionsCollection
@@ -1055,7 +1109,6 @@ async function run() {
           .sort({ paidAt: -1 })
           .toArray();
 
-        // Populate with tuition and user details
         const populatedTransactions = await Promise.all(
           transactions.map(async (transaction) => {
             const tuition = await tuitionsCollection.findOne({
@@ -1078,7 +1131,7 @@ async function run() {
       }
     });
 
-    /* ================= CONTACT FORM (OPTIONAL) ================= */
+    /* ================= CONTACT FORM ================= */
 
     app.post("/contact", async (req, res) => {
       try {
@@ -1095,7 +1148,7 @@ async function run() {
     });
 
     await client.db("admin").command({ ping: 1 });
-    console.log("MongoDB connected successfully");
+    console.log("✅ MongoDB connected successfully");
   } catch (error) {
     console.error(error);
   }
@@ -1108,5 +1161,5 @@ app.get("/", (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`✅ Server running on port ${port}`);
 });
